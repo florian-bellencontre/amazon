@@ -8,12 +8,17 @@ const log = Minilog('ContentScript')
 Minilog.enable()
 
 const baseUrl = 'https://www.amazon.fr'
+const orderHistoryUrl = `${baseUrl}/gp/css/order-history`
 const desktopUserAgent =
-  'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/118.0'
-let timeFilterSelector
+  'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0'
+// Amazon renamed the email input on the signin page from #ap_email to
+// #ap_email_login ; keep both so the konnector survives an A/B rollback
+const emailInputSelector = '#ap_email_login, #ap_email'
+const signOutLinkSelector = 'a[href*="/gp/flex/sign-out.html?"]'
+const orderCardSelector = '.order-card.js-order-card'
+const ORDERS_PER_PAGE = 10
 // TODO use a flag to change this value
 let FORCE_FETCH_ALL = false
-// const orderUrl = `${baseUrl}/gp/your-account/order-history`
 const vendor = 'amazon'
 
 class AmazonContentScript extends ContentScript {
@@ -36,11 +41,16 @@ class AmazonContentScript extends ContentScript {
       })
       await this.runInWorkerUntilTrue({ method: 'checkUserAgentReload' })
     }
-    if (await this.isElementInWorker('#nav-link-accountList')) {
-      await this.runInWorker('click', '#nav-link-accountList')
+    await this.runInWorker('dismissCookieBanner')
+    if (await this.isElementInWorker(signOutLinkSelector)) {
+      this.log('info', 'Already authenticated, no need to reach the login form')
+      return
     }
+    // #nav-link-accountList is not a link anymore, the signin url lives in an
+    // anchor inside of it
+    await this.runInWorker('clickSignInLink')
     await Promise.race([
-      this.waitForElementInWorker('#ap_email'),
+      this.waitForElementInWorker(emailInputSelector),
       this.waitForElementInWorker('#nav-item-signout')
     ])
   }
@@ -52,7 +62,7 @@ class AmazonContentScript extends ContentScript {
     if (!account) {
       await this.ensureNotAuthenticated()
     }
-    if (!(await this.isElementInWorker('#ap_email'))) {
+    if (!(await this.isElementInWorker(emailInputSelector))) {
       await this.navigateToLoginForm()
     }
     const authenticated = await this.runInWorker('checkAuthenticated')
@@ -66,7 +76,7 @@ class AmazonContentScript extends ContentScript {
           this.log('info', 'Got credentials, trying autologin')
           await this.tryAutoLogin(credentials)
         } catch (err) {
-          this.log('debug', 'autoLogin error' + err.message)
+          this.log('debug', 'autoLogin error ' + err.message)
           await this.showLoginFormAndWaitForAuthentication()
         }
       } else {
@@ -84,19 +94,17 @@ class AmazonContentScript extends ContentScript {
   async ensureNotAuthenticated() {
     this.log('info', '📍️ ensureNotAuthenticated starts')
     await this.navigateToLoginForm()
-    const isConnected = await this.isElementInWorker(
-      'a[href*="/gp/flex/sign-out"]'
-    )
+    const isConnected = await this.isElementInWorker(signOutLinkSelector)
     if (isConnected) {
-      await this.runInWorker('click', 'a[href*="/gp/flex/sign-out"]')
-      await this.waitForElementInWorker('#ap_email')
+      await this.runInWorker('click', signOutLinkSelector)
+      await this.waitForElementInWorker(emailInputSelector)
     }
   }
 
   // W
   async checkAuthenticated() {
     this.log('info', '📍️ checkAuthenticated starts')
-    const mailInput = document.querySelector('#ap_email')
+    const mailInput = document.querySelector(emailInputSelector)
     const passwordInput = document.querySelector('#ap_password')
     if (mailInput) {
       await this.setListenerLogin()
@@ -104,9 +112,16 @@ class AmazonContentScript extends ContentScript {
     if (passwordInput) {
       await this.setListenerPassword()
     }
-    const result = Boolean(
-      document.querySelector('a[href*="/gp/flex/sign-out.html?"]')
+    // After a login amazon may show an "add a phone number/email" interstitial,
+    // dismiss it automatically as this method is polled during authentication
+    const fixupSkipLink = document.querySelector(
+      '#ap-account-fixup-phone-skip-link'
     )
+    if (fixupSkipLink) {
+      this.log('info', 'Dismissing account fixup interstitial')
+      fixupSkipLink.click()
+    }
+    const result = Boolean(document.querySelector(signOutLinkSelector))
     this.log('debug', 'Authentification detection : ' + result)
     return result
   }
@@ -114,41 +129,52 @@ class AmazonContentScript extends ContentScript {
   // P
   async tryAutoLogin(credentials) {
     this.log('info', '📍️ tryAutoLogin starts')
-    await Promise.all([
-      this.waitForElementInWorker('#ap_email'),
-      this.waitForElementInWorker('#continue')
-    ])
+    await this.waitForElementInWorker(emailInputSelector)
+    await this.waitForElementInWorker('#continue')
 
     // Enter login
-    const emailFieldSelector = '#ap_email'
-    await this.runInWorker('fillText', emailFieldSelector, credentials.email)
-    // Click continue
-    // Watch out: multiples input#continue buttons
-    await this.clickAndWait('input[id="continue"]', '[name="rememberMe"]')
+    await this.runInWorker('fillText', emailInputSelector, credentials.email)
+    // Click continue: now a span#continue containing the real submit input
+    await this.clickAndWait(
+      '#continue input.a-button-input, input[id="continue"]',
+      '#ap_password'
+    )
 
     // Enter password
-    const passFieldSelector = '#ap_password'
-    await this.runInWorker('fillText', passFieldSelector, credentials.password)
+    await this.runInWorker('fillText', '#ap_password', credentials.password)
 
-    // Click check box
+    // Click check box (if present)
     await this.runInWorker('checkingBox')
 
     // Click Login
-    const loginButtonSelector = 'input#signInSubmit'
-    await this.runInWorker('click', loginButtonSelector)
+    await this.runInWorker('click', 'input#signInSubmit')
+
+    // The account may require a TOTP or captcha step : detect it and hand the
+    // webview over to the user instead of failing
+    await Promise.race([
+      this.waitForElementInWorker(signOutLinkSelector, { timeout: 30 * 1000 }),
+      this.waitForElementInWorker('#auth-mfa-otpcode', { timeout: 30 * 1000 })
+    ])
+    if (!(await this.runInWorker('checkAuthenticated'))) {
+      this.log(
+        'info',
+        'Autologin needs a user action (TOTP/captcha), showing worker'
+      )
+      await this.showLoginFormAndWaitForAuthentication()
+    }
   }
 
   findAndSendCredentials() {
     this.log('info', '📍️ findAndSendCredentials starts')
-    const emailField = document.querySelector('#ap_email')
+    const emailField = document.querySelector(emailInputSelector)
     const passwordField = document.querySelector('#ap_password')
     this.log('debug', 'Executing findAndSendCredentials')
-    if (emailField) {
+    if (emailField && emailField.value) {
       this.sendToPilot({
         email: emailField.value
       })
     }
-    if (passwordField) {
+    if (passwordField && passwordField.value) {
       this.sendToPilot({
         password: passwordField.value
       })
@@ -171,7 +197,7 @@ class AmazonContentScript extends ContentScript {
 
   // W
   async setListenerLogin() {
-    const loginField = document.querySelector('#ap_email')
+    const loginField = document.querySelector(emailInputSelector)
     if (loginField) {
       loginField.addEventListener(
         'change',
@@ -195,10 +221,35 @@ class AmazonContentScript extends ContentScript {
   async checkingBox() {
     const checkbox = document.querySelector('[name="rememberMe"]')
     // Checking the 'Stay connected' checkbox when loaded
-    if (checkbox.checked == false) {
+    if (checkbox && checkbox.checked == false) {
       this.log('debug', 'Checking the RememberMe box')
       checkbox.click()
     }
+  }
+
+  // W
+  async dismissCookieBanner() {
+    const rejectButton = document.querySelector('#sp-cc-rejectall-link')
+    if (rejectButton) {
+      this.log('info', 'Dismissing cookie banner')
+      rejectButton.click()
+    }
+    return true
+  }
+
+  // W
+  async clickSignInLink() {
+    const signInLink = document.querySelector('a[href*="/ap/signin"]')
+    if (signInLink) {
+      signInLink.click()
+      return true
+    }
+    // fallback : the old direct click on the nav element
+    const accountList = document.querySelector('#nav-link-accountList')
+    if (accountList) {
+      accountList.click()
+    }
+    return true
   }
 
   // P
@@ -213,10 +264,9 @@ class AmazonContentScript extends ContentScript {
       }
       await this.saveCredentials(userCredentials)
     }
-    await this.waitForElementInWorker('#nav_prefetch_yourorders')
-    await this.runInWorker('click', '#nav_prefetch_yourorders')
-    timeFilterSelector = await this.determineDropdownId()
-    let years = await this.runInWorker('getYears', timeFilterSelector)
+    await this.goto(orderHistoryUrl)
+    await this.waitForElementInWorker('#time-filter')
+    let periods = await this.runInWorker('getYears', '#time-filter')
     if (!FORCE_FETCH_ALL) {
       // If false, we just need the last period depending on the distanceInDays value
       if (distanceInDays <= 30) {
@@ -224,103 +274,93 @@ class AmazonContentScript extends ContentScript {
           'info',
           'lastExecution under or equals 30 days, fetching the last 30 days period'
         )
-        years = ['last30']
+        periods = ['last30']
       }
       if (distanceInDays > 30 && distanceInDays < 90) {
         this.log(
           'info',
           'lastExecution between 30 and 90 days, fetching the last 3 months period'
         )
-        years = ['months-3']
+        periods = ['months-3']
       }
     }
-    if (years[0] !== 'months-3') {
-      await this.runInWorker('deleteElement', '.num-orders')
-      // ///////////// USED TO DEBUG A SPECIFIC YEAR /////
-      // years = ['year-2020']
-      // /////////////////////////////////////////////////
-      await this.navigateToNextPeriod(years[0])
-    }
-    this.log('debug', 'Years :' + years)
-    for (let i = 0; i < years.length; i++) {
-      this.log('debug', 'Saving year ' + years[i])
-      timeFilterSelector = await this.determineDropdownId()
-      await Promise.race([
-        this.waitForElementInWorker('#rhf-container'),
-        this.waitForElementInWorker('.js-order-card')
-      ])
-      await this.waitForElementInWorker('.num-orders')
-      let numberOfCommands = await this.runInWorkerUntilTrue({
-        method: 'getNumberOfCommands'
-      })
-      if (numberOfCommands === 'zero') {
-        numberOfCommands === 0
-      }
-      this.log('debug', `numberOfCommands : ${numberOfCommands}`)
-      await this.runInWorkerUntilTrue({
-        method: 'waitForOrdersLoading',
-        args: [numberOfCommands]
-      })
-      await this.runInWorker('deleteElement', '.num-orders')
-      let lastYearsArrayEntry = years[years.length - 1]
-      if (numberOfCommands === 0) {
-        this.log('info', `No commands found for period ${years[i]}`)
-        if (years[i] === lastYearsArrayEntry) {
-          this.log('info', 'This was the last year found')
-          break
-        }
-        await this.navigateToNextPeriod(years[i + 1])
+    this.log('debug', 'Periods : ' + periods)
+    for (const period of periods) {
+      this.log('info', `Fetching period ${period}`)
+      await this.navigateToOrdersPage(period, 0)
+      const ordersCount = await this.runInWorker('getOrdersCount')
+      this.log('info', `Found ${ordersCount} orders for period ${period}`)
+      if (ordersCount === 0) {
         continue
       }
-      this.log(
-        'info',
-        `found ${numberOfCommands} commands for this year, fetching them`
-      )
-      let periodBills
-      let j = 1
-      let hasMorePage = true
-      while (hasMorePage) {
-        this.log('info', `fetching bills for page ${j}`)
-        timeFilterSelector = await this.determineDropdownId()
-        const pageBills = await this.fetchPeriod({
-          context,
-          period: years[i],
-          page: j,
-          numberOfCommands
-        })
-        periodBills = pageBills
-        await this.saveBills(periodBills, {
-          context,
-          fileIdAttributes: ['vendorRef'],
-          contentType: 'application/pdf',
-          qualificationLabel: 'other_invoice'
-        })
-        hasMorePage = await this.runInWorker('checkIfHasMorePage')
-        if (hasMorePage) {
-          this.log('info', 'One more page detected, proceeding')
-          await this.runInWorker('click', '.a-last > a')
-          await this.waitForElementInWorker('.num-orders')
-          await this.runInWorkerUntilTrue({
-            method: 'waitForOrdersLoading',
-            args: [numberOfCommands]
+      const pagesCount = Math.ceil(ordersCount / ORDERS_PER_PAGE)
+      for (let page = 0; page < pagesCount; page++) {
+        this.log('info', `Fetching bills for page ${page + 1}/${pagesCount}`)
+        if (page > 0) {
+          await this.navigateToOrdersPage(period, page * ORDERS_PER_PAGE)
+        }
+        await this.runInWorkerUntilTrue({ method: 'waitForOrdersLoading' })
+        const pageBills = await this.fetchPageBills()
+        if (pageBills.length > 0) {
+          await this.saveBills(pageBills, {
+            context,
+            fileIdAttributes: ['vendorRef'],
+            contentType: 'application/pdf',
+            qualificationLabel: 'other_invoice'
           })
-          await this.runInWorker('deleteElement', '.num-orders')
-          j++
-        } else {
-          this.log('info', 'no more page for this period')
         }
       }
-      this.log('info', 'Fetching for this period ends, checking next period')
-      if (years[i] === lastYearsArrayEntry) {
-        this.log('info', 'This was the last year found')
-        break
-      }
-      // If the period selector is not visible in the webview frame, the following function cannot click
-      // on the list box button. To prevent this happening, we need to scroll the webview back up
-      // to the top of the page
-      await this.runInWorker('scrollToTop')
-      await this.navigateToNextPeriod(years[i + 1])
     }
+  }
+
+  // P
+  async navigateToOrdersPage(period, startIndex) {
+    this.log(
+      'info',
+      `📍️ navigateToOrdersPage starts - ${period} startIndex ${startIndex}`
+    )
+    // The year dropdown is a native select now : navigating with the
+    // timeFilter url parameter is more reliable than emulating the dropdown.
+    // Remove the current counter element first so we cannot match the previous
+    // page's DOM while the new one is loading.
+    await this.runInWorker('deleteElement', '.num-orders')
+    await this.goto(
+      `${orderHistoryUrl}?timeFilter=${period}&startIndex=${startIndex}`
+    )
+    await this.waitForElementInWorker('.num-orders')
+  }
+
+  // P
+  async fetchPageBills() {
+    this.log('info', '📍️ fetchPageBills starts')
+    const cardsCount = await this.runInWorker('getCardsCount')
+    let pageBills = []
+    for (let i = 0; i < cardsCount; i++) {
+      const bill = await this.runInWorker('fetchOrderBill', i)
+      if (bill === null || bill === 'skip') {
+        continue
+      }
+      if (Array.isArray(bill.fileurl)) {
+        this.log('debug', 'fileurl is an Array, splitting bill')
+        let billNumber = 1
+        for (const url of bill.fileurl) {
+          const oneBill = {
+            ...bill
+          }
+          oneBill.fileurl = url
+          oneBill.filename = oneBill.filename.replace(
+            '.pdf',
+            `_facture${billNumber}.pdf`
+          )
+          oneBill.vendorRef = `${oneBill.vendorRef}_${billNumber}`
+          pageBills.push(oneBill)
+          billNumber++
+        }
+      } else {
+        pageBills.push(bill)
+      }
+    }
+    return pageBills
   }
 
   async handleContextInfos(context) {
@@ -373,48 +413,6 @@ class AmazonContentScript extends ContentScript {
     return true
   }
 
-  async determineDropdownId() {
-    this.log('info', '📍️ determineDropdownId starts')
-    let selector
-    // Regarding the accounts we have to develop this konnector,
-    // we could find different selectors for the years dropdown list
-    await Promise.race([
-      this.waitForElementInWorker('#time-filter'),
-      this.waitForElementInWorker('#orderFilter')
-    ])
-    if (await this.isElementInWorker('#time-filter')) {
-      selector = '#time-filter'
-    } else {
-      selector = '#orderFilter'
-    }
-    this.log('info', `determineDropdownId - selector : ${selector}`)
-    return selector
-  }
-
-  async navigateToNextPeriod(period) {
-    this.log('info', '📍️ navigateToNextPeriod starts')
-    await this.waitForElementInWorker(`${timeFilterSelector}`)
-    await waitFor(
-      async () => {
-        await this.runInWorker('click', `${timeFilterSelector}`)
-        const listIsVisible = await this.isElementInWorker('ul[role="listbox"]')
-        if (listIsVisible) return true
-        return false
-      },
-      {
-        interval: 1000,
-        timeout: 30 * 1000
-      }
-    )
-    await this.runInWorker('click', `[data-value*="${period}"]`)
-  }
-
-  // W
-  async clickNextYear(period) {
-    this.log('info', '📍️ clickNextYear starts')
-    document.querySelector(`a[data-value*="${period}"`).click()
-  }
-
   // W
   async getYears(selector) {
     this.log('info', '📍️ getYears starts')
@@ -424,112 +422,273 @@ class AmazonContentScript extends ContentScript {
   }
 
   // W
-  async getNumberOfCommands() {
-    this.log('info', '📍️ getNumberOfCommands starts')
-    let numberOfCommands
+  async getOrdersCount() {
+    this.log('info', '📍️ getOrdersCount starts')
+    let ordersCount
     await waitFor(
       () => {
-        const element = document.querySelector('.num-orders').textContent
-        if (element.includes('commande')) {
-          numberOfCommands = parseInt(element.split(' ')[0])
+        const element = document.querySelector('.num-orders')
+        if (element && element.textContent.includes('commande')) {
+          ordersCount = parseInt(element.textContent.trim(), 10)
+          if (isNaN(ordersCount)) {
+            ordersCount = 0
+          }
           return true
-        } else {
-          return false
         }
+        return false
       },
       {
         interval: 1000,
         timeout: 30 * 1000
       }
     )
-    this.log('info', 'returning numberOfCommands')
-    // As zero of number type is consider falsy by javascript,
-    // we cannot just return '0' from the function as it await for a truthy value to resolve
-    if (numberOfCommands === 0) {
-      return 'zero'
-    }
-    return numberOfCommands
+    return ordersCount
   }
 
-  async fetchPeriod(infos) {
-    this.log(
-      'debug',
-      `Fetching the list of orders for page ${infos.page} of period ${infos.period}`
-    )
-    let numberOfCards = await this.runInWorker('getNumberOfCardsPerPage')
-    let wantedId = 1
-    for (let i = 0; i < numberOfCards; i++) {
-      await waitFor(
-        async () => {
-          const hasLink = await this.runInWorker('checkOrderDownloadLink', i)
-          if (hasLink) {
-            await this.runInWorker('makeBillDownloadLinkVisible', i)
-            const isOk = await this.isElementInWorker(
-              `#a-popover-content-${wantedId} > ul > li > span > .a-link-normal`
+  // W
+  async waitForOrdersLoading() {
+    this.log('info', '📍️ waitForOrdersLoading starts')
+    await waitFor(
+      () => {
+        const foundOrders = document.querySelectorAll(orderCardSelector)
+        if (foundOrders.length === 0) {
+          return false
+        }
+        for (const foundOrder of foundOrders) {
+          const hasHeader = foundOrder.querySelector(
+            '.order-header__header-list-item'
+          )
+          const hasOrderId = foundOrder.querySelector('.yohtmlc-order-id')
+          if (!hasHeader || !hasOrderId) {
+            this.log(
+              'info',
+              'One order card is not loaded yet, waiting for all cards to load properly'
             )
-            let message
-            if (isOk) {
-              message = `🦜️ Link ${wantedId} visible, continue to next loop`
-              wantedId++
-            } else {
-              message = `🏮️ Link ${wantedId} not visible, retrying`
-              await this.evaluateInWorker(() => {
-                const popoverDisplaysAlert = document
-                  .querySelector(`#a-popover-${wantedId}`)
-                  .querySelector('.a-icon-alert')
-                // If website did not manage to load the downloadLinks it shows an error in the popover
-                // If it happens, close and click again on the link usually resolve the issue.
-                // To do so, just click outside the popover on any element (here I choose the white background), this will close the popover
-                if (popoverDisplaysAlert) {
-                  this.log(
-                    'info',
-                    'Website generate an error when trying to show downloadLinks, retrying ...'
-                  )
-                  document.querySelector('#a-page').click()
-                }
-              })
-            }
-            this.log('info', message)
-            return isOk
-          } else {
-            this.log('info', 'This order has no links to click, continue')
-            return true
-          }
-        },
-        {
-          interval: 1000,
-          timeout: {
-            milliseconds: 30000,
-            message: new TimeoutError(
-              `The click on the download link Button timed out after 30000 ms`
-            )
+            return false
           }
         }
-      )
-      this.log('info', 'element ok, continue')
-    }
-    const pageBills = await this.runInWorker('fetchBills', numberOfCards)
-    return pageBills
+        return true
+      },
+      {
+        interval: 500,
+        timeout: {
+          milliseconds: 30000,
+          message: new TimeoutError(
+            `waitForOrdersLoading timed out after 30000 ms`
+          )
+        }
+      }
+    )
+    return true
   }
 
+  // W
+  getCardsCount() {
+    this.log('info', '📍️ getCardsCount starts')
+    return document.querySelectorAll(orderCardSelector).length
+  }
+
+  // W
   deleteElement(element) {
-    // As we loop on the commands page, every time we changing period, we got the exact same elements in the following page.
-    // To avoid problems when checking or waiting for a specific element between page changes
-    // we remove the element from the html so it's not present anymore and come back with any new page or reload.
-    document.querySelector(element).remove()
+    // As we loop on the orders pages, every page contains the exact same elements.
+    // To avoid matching an element of the previous page while the next one loads,
+    // we remove it from the html before navigating.
+    const foundElement = document.querySelector(element)
+    if (foundElement) {
+      foundElement.remove()
+    }
+    return true
   }
 
-  async checkOrderDownloadLink(number) {
-    this.log('info', '📍️ checkOrderDownloadLink starts')
-    const orders = this.determineCardsToFetch()
-    const order = orders[number]
-    const orderLinks = order.querySelectorAll('.a-popover-trigger')
-    if (orderLinks.length === 0) {
-      this.log('info', 'No links found for this order')
-      return false
-    } else {
-      return true
+  // W
+  async fetchOrderBill(cardIndex) {
+    this.log('info', `📍️ fetchOrderBill starts for card ${cardIndex}`)
+    const card = document.querySelectorAll(orderCardSelector)[cardIndex]
+    if (!card) {
+      this.log('warn', `Card ${cardIndex} not found on page`)
+      return null
     }
+    const headerItems = card.querySelectorAll('.order-header__header-list-item')
+    const dateText = headerItems[0]
+      ?.querySelector('.a-size-base')
+      ?.textContent.trim()
+    const totalText = headerItems[1]
+      ?.querySelector('.a-size-base')
+      ?.textContent.trim()
+    if (!dateText || !totalText) {
+      this.log('warn', `Card ${cardIndex} misses date or total, skipping`)
+      return 'skip'
+    }
+    if (totalText.match(/crédit(s)? audio/g)) {
+      this.log('info', 'Found an audiobook, jumping this bill')
+      return 'skip'
+    }
+    const amountMatch = totalText.match(/([\d\s\u00a0.,]+)/)
+    const currencyMatch = totalText.match(/([^\d\s\u00a0.,]+)/)
+    if (!amountMatch) {
+      this.log('warn', `Cannot parse amount "${totalText}", skipping`)
+      return 'skip'
+    }
+    const parsedAmount = parseFloat(
+      amountMatch[1].replace(/[\s\u00a0]/g, '').replace(',', '.')
+    )
+    if (parsedAmount === 0) {
+      this.log(
+        'info',
+        'Found a free product, no bill attached to it, jumping this bill'
+      )
+      return 'skip'
+    }
+    const currency = currencyMatch ? currencyMatch[1] : '€'
+    const orderIdText = card.querySelector('.yohtmlc-order-id')?.textContent
+    const orderIdMatch = orderIdText && orderIdText.match(/(\d{3}-\d+-\d+)/)
+    if (!orderIdMatch) {
+      this.log('warn', `Cannot find order number on card ${cardIndex}`)
+      return 'skip'
+    }
+    const vendorRef = orderIdMatch[1]
+    const parsedDate = parse(dateText, 'd MMMM yyyy', new Date(), {
+      locale: fr
+    })
+    const formattedDate = format(parsedDate, 'yyyy-MM-dd')
+    const billProducts = []
+    const seenProducts = new Set()
+    const foundProducts = card.querySelectorAll(
+      'a[href*="/dp/"], a[href*="/gp/product/"]'
+    )
+    for (const link of foundProducts) {
+      const articleName = link.textContent.trim()
+      const href = link.getAttribute('href')
+      if (!articleName || seenProducts.has(href)) {
+        continue
+      }
+      seenProducts.add(href)
+      billProducts.push({
+        articleLink: href.startsWith('http') ? href : baseUrl + href,
+        articleName
+      })
+    }
+    const invoiceUrls = await this.getOrderInvoiceUrls(card)
+    if (invoiceUrls === null) {
+      this.log('info', `No invoice popover for card ${cardIndex}, skipping`)
+      return 'skip'
+    }
+    if (invoiceUrls.length === 0) {
+      this.log(
+        'info',
+        'Found an order with no bill attached to it, jumping this bill'
+      )
+      return 'skip'
+    }
+    return {
+      vendor: 'amazon.fr',
+      date: formattedDate,
+      amount: parsedAmount,
+      currency,
+      vendorRef,
+      fileurl: invoiceUrls.length > 1 ? invoiceUrls : invoiceUrls[0],
+      filename: `${formattedDate}_${vendor}_${parsedAmount}${currency}.pdf`,
+      billProducts,
+      fileAttributes: {
+        metadata: {
+          contentAuthor: 'amazon',
+          datetime: new Date(formattedDate),
+          datetimeLabel: 'issueDate',
+          carbonCopy: true
+        }
+      }
+    }
+  }
+
+  // W
+  async getOrderInvoiceUrls(card) {
+    const factureLink = Array.from(
+      card.querySelectorAll('a.a-link-normal')
+    ).find(a => (a.textContent || '').trim().startsWith('Facture'))
+    if (!factureLink) {
+      return null
+    }
+    const getPopoverIds = () =>
+      Array.from(document.querySelectorAll('[id^="a-popover-content-"]')).map(
+        el => el.id
+      )
+    let popoverId = null
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const idsBefore = getPopoverIds()
+      factureLink.click()
+      try {
+        await waitFor(
+          () => {
+            if (!popoverId) {
+              popoverId = getPopoverIds().find(id => !idsBefore.includes(id))
+            }
+            if (!popoverId) {
+              return false
+            }
+            const popover = document.getElementById(popoverId)
+            if (!popover) {
+              return false
+            }
+            // popover content is loaded asynchronously : ready when it shows
+            // either the links list or an error alert
+            return Boolean(
+              popover.querySelector('ul > li > span > .a-link-normal') ||
+                popover.querySelector('.a-icon-alert')
+            )
+          },
+          {
+            interval: 500,
+            timeout: 15 * 1000
+          }
+        )
+      } catch (err) {
+        this.log(
+          'warn',
+          `Timed out waiting for invoice popover (attempt ${attempt + 1})`
+        )
+      }
+      const popover = popoverId && document.getElementById(popoverId)
+      if (popover && !popover.querySelector('.a-icon-alert')) {
+        const urls = Array.from(
+          popover.querySelectorAll('a[href*="invoice.pdf"]')
+        ).map(a => {
+          const href = a.getAttribute('href')
+          return href.startsWith('http') ? href : baseUrl + href
+        })
+        this.closePopover()
+        return urls
+      }
+      // If the website did not manage to load the download links it shows an
+      // error in the popover. Closing and clicking again usually resolves it.
+      this.log(
+        'info',
+        'Website generated an error when trying to show downloadLinks, retrying ...'
+      )
+      this.closePopover()
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+    return []
+  }
+
+  // W
+  closePopover() {
+    // Clicking outside the popover (here the page background) closes it
+    const page = document.querySelector('#a-page')
+    if (page) {
+      page.click()
+    }
+    const closeButton = document.querySelector(
+      '.a-popover:not([style*="display: none"]) .a-button-close'
+    )
+    if (closeButton) {
+      closeButton.click()
+    }
+  }
+
+  // W
+  scrollToTop() {
+    this.log('info', 'scrollToTop starts')
+    window.scrollTo({ top: 0, behavior: 'instant' })
   }
 
   // P
@@ -552,238 +711,6 @@ class AmazonContentScript extends ContentScript {
       }
     }
   }
-
-  async fetchBills(numberOfCards) {
-    this.log('info', '📍️ fetchBills starts')
-    let foundOrders = this.determineCardsToFetch()
-    const numberOfOrders = numberOfCards
-    let commandsToBills = []
-    let wantedId = 1
-    for (let i = 0; i < numberOfOrders; i++) {
-      const commands = await this.computeCommands(foundOrders[i], wantedId)
-      if (commands === null) {
-        continue
-      }
-      if (commands === 'audiobook' || commands === 'noBill') {
-        wantedId++
-        continue
-      }
-      if (Array.isArray(commands.fileurl)) {
-        this.log('debug', 'fileurl is an Array, splitting bill')
-        let billNumber = 1
-        for (const url of commands.fileurl) {
-          const oneBill = {
-            ...commands
-          }
-          oneBill.fileurl = url
-          oneBill.filename = oneBill.filename.replace(
-            '.pdf',
-            `_facture${billNumber}.pdf`
-          )
-          oneBill.vendorRef = `${oneBill.vendorRef}_${billNumber}`
-          commandsToBills.push(oneBill)
-          billNumber++
-        }
-        wantedId++
-      } else {
-        commandsToBills.push(commands)
-        wantedId++
-      }
-    }
-    return commandsToBills
-  }
-
-  makeBillDownloadLinkVisible(number) {
-    this.log('info', 'makeBillDownloadLinkVisible starts')
-    const orders = this.determineCardsToFetch()
-    this.clickBillButton(orders[number])
-  }
-
-  clickBillButton(order) {
-    this.log('info', 'clickBillButton starts')
-    const orderLinks = order.querySelectorAll('.a-popover-trigger')
-    orderLinks.forEach(popover => {
-      if (popover.textContent.includes('Facture')) {
-        popover.click()
-      } else {
-        order.querySelectorAll('.a-link-normal').forEach(element => {
-          if (element.textContent.includes('Facture')) {
-            element.click()
-          }
-        })
-      }
-    })
-  }
-
-  computeCommands(order, wantedId) {
-    this.log('info', '📍️ computeCommands starts')
-    const [foundCommandDate, foundCommandPrice, ,] =
-      order.querySelectorAll('.value')
-    const amount = foundCommandPrice.textContent.trim().substring(1)
-    if (amount.match(/crédit(s)? audio/g)) {
-      this.log('info', 'Found an audiobook, jumping this bill')
-      return 'audiobook'
-    }
-    if (amount === '0,00') {
-      this.log(
-        'info',
-        'Found a free product, no bill attached to it, jumping this bill'
-      )
-      return null
-    }
-    const parsedAmount = parseFloat(amount.replace(',', '.'))
-    const currency = foundCommandPrice.textContent.trim().substring(0, 1)
-    const commandDate = foundCommandDate.textContent.trim()
-    const parsedDate = parse(commandDate, 'd MMMM yyyy', new Date(), {
-      locale: fr
-    })
-    const formattedDate = format(parsedDate, 'yyyy-MM-dd')
-    const vendorRef = order.querySelector('bdi').textContent
-    const billProducts = []
-    const foundProducts = order.querySelectorAll(
-      '.a-row > a[href*="/gp/product/"]'
-    )
-    for (const link of foundProducts) {
-      const articleLink = baseUrl + link.getAttribute('href')
-      const articleName = link.textContent.trim()
-      const article = {
-        articleLink,
-        articleName
-      }
-      billProducts.push(article)
-    }
-    const foundUrls = document.querySelectorAll(
-      `#a-popover-content-${wantedId} > ul > li > span > a[href*="invoice.pdf"]`
-    )
-    let urlsArray = []
-    for (const singleUrl of foundUrls) {
-      const href = singleUrl.getAttribute('href')
-      urlsArray.push(baseUrl + href)
-    }
-    if (urlsArray.length === 0) {
-      this.log(
-        'info',
-        'Found an article with no bill attached to it, jumping this bill'
-      )
-      return 'noBill'
-    }
-    const fileurl = urlsArray.length > 1 ? urlsArray : urlsArray[0]
-    let command = {
-      vendor: 'amazon.fr',
-      date: formattedDate,
-      amount: parsedAmount,
-      currency,
-      vendorRef,
-      fileurl,
-      filename: `${formattedDate}_${vendor}_${parsedAmount}${currency}.pdf`,
-      billProducts,
-      fileAttributes: {
-        metadata: {
-          contentAuthor: 'amazon',
-          datetime: new Date(formattedDate),
-          datetimeLabel: 'issueDate',
-          carbonCopy: true
-        }
-      }
-      // requestOptions: {
-      //   headers: {
-      //     Accept:
-      //       'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-      //     'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-      //     'Cache-Control': 'no-cache',
-      //     Connection: 'keep-alive',
-      //     Pragma: 'no-cache',
-      //     Referer: 'https://www.amazon.fr/',
-      //     'Sec-Fetch-Dest': 'document',
-      //     'Sec-Fetch-Mode': 'navigate',
-      //     'Sec-Fetch-Site': 'cross-site',
-      //     'Sec-Fetch-User': '?1',
-      //     'Upgrade-Insecure-Requests': '1'
-      //   }
-      // }
-    }
-    return command
-  }
-
-  getNumberOfCardsPerPage() {
-    this.log('info', '📍️ getNumberOfCardsPerPage starts')
-    const cardsToFetch = this.determineCardsToFetch()
-    const numberOfCards = cardsToFetch.length
-    return numberOfCards
-  }
-
-  scrollToTop() {
-    this.log('info', 'scrollToTop starts')
-    window.scrollTo({ top: 0, behavior: 'instant' })
-  }
-
-  async waitForOrdersLoading(numberOfOrders) {
-    this.log('info', '📍️ waitForOrdersLoading starts')
-    let maxPerPage = 10
-
-    await waitFor(
-      () => {
-        let foundOrders = this.determineCardsToFetch()
-        let foundOrdersLength = foundOrders.length
-        if (
-          !foundOrdersLength === numberOfOrders &&
-          foundOrdersLength < maxPerPage
-        ) {
-          return false
-        } else {
-          this.log('info', 'foundOrders length match numberOfOrders')
-          for (const foundOrder of foundOrders) {
-            const foundOrderInfos = foundOrder.querySelectorAll(
-              'div[class*="a-fixed-left-grid a-spacing-"]'
-            )
-            for (const info of foundOrderInfos) {
-              const isFullfilled = Boolean(info.innerText.length > 0)
-              if (!isFullfilled) {
-                this.log(
-                  'info',
-                  'One article is not loaded, waiting for all articles to load properly'
-                )
-                return false
-              }
-            }
-          }
-          return true
-        }
-      },
-      {
-        interval: 500,
-        timeout: {
-          milliseconds: 30000,
-          message: new TimeoutError(
-            `waitForOrdersLoading timed out after 30000 ms`
-          )
-        }
-      }
-    )
-    return true
-  }
-
-  checkIfHasMorePage() {
-    this.log('info', '📍️ checkIfHasMorePage starts')
-    const element = document.querySelector('.a-last')
-    if (element) {
-      const isEnabled = !element.classList.contains('a-disabled')
-      return isEnabled
-    }
-    return false
-  }
-
-  determineCardsToFetch() {
-    this.log('info', '📍️ determineCardsToFetch starts')
-    const jsOrderElements = document.querySelectorAll('.js-order-card > .order')
-    const ordersToFetch = []
-    for (const element of jsOrderElements) {
-      if (element.querySelector('.order-info')) {
-        ordersToFetch.push(element)
-      }
-    }
-    return ordersToFetch
-  }
 }
 
 const connector = new AmazonContentScript()
@@ -795,16 +722,14 @@ connector
       'checkingBox',
       'setListenerLogin',
       'setListenerPassword',
-      'clickNextYear',
-      'getNumberOfCommands',
+      'dismissCookieBanner',
+      'clickSignInLink',
+      'getOrdersCount',
+      'getCardsCount',
       'deleteElement',
-      'fetchBills',
-      'makeBillDownloadLinkVisible',
-      'getNumberOfCardsPerPage',
-      'scrollToTop',
+      'fetchOrderBill',
       'waitForOrdersLoading',
-      'checkIfHasMorePage',
-      'checkOrderDownloadLink'
+      'scrollToTop'
     ]
   })
   .catch(err => {
