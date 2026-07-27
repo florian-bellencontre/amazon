@@ -17,10 +17,33 @@ const emailInputSelector = '#ap_email_login, #ap_email'
 const signOutLinkSelector = 'a[href*="/gp/flex/sign-out.html?"]'
 const orderCardSelector = '.order-card.js-order-card'
 const ORDERS_PER_PAGE = 10
+// fallback path only : how often to checkpoint with saveBills
 const SAVE_BILLS_EVERY_PAGES = 5
+// the orders pages served to fetch() are empty shells (cards are rendered by
+// the page javascript), so pages are loaded in hidden same-origin iframes.
+// Two of them keep memory usage acceptable in the mobile webview.
+const IFRAME_CONCURRENCY = 2
+const POPOVER_FETCH_CONCURRENCY = 8
+// orders more recent than this can still receive new documents (credit notes,
+// late invoices) : never skip them even when they are already saved
+const KNOWN_ORDERS_RECHECK_DAYS = 90
 // TODO use a flag to change this value
 let FORCE_FETCH_ALL = false
 const vendor = 'amazon'
+
+async function mapWithConcurrency(items, concurrency, fn) {
+  const results = new Array(items.length)
+  let next = 0
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (next < items.length) {
+        const index = next++
+        results[index] = await fn(items[index], index)
+      }
+    })
+  )
+  return results
+}
 
 class AmazonContentScript extends ContentScript {
   async setUserAgent() {
@@ -286,40 +309,143 @@ class AmazonContentScript extends ContentScript {
       }
     }
     this.log('debug', 'Periods : ' + periods)
+    const knownOrderIds = await this.getKnownOrderIds()
+    const knownSkipMaxDate = format(
+      new Date(Date.now() - KNOWN_ORDERS_RECHECK_DAYS * 24 * 60 * 60 * 1000),
+      'yyyy-MM-dd'
+    )
     for (const period of periods) {
       this.log('info', `Fetching period ${period}`)
-      await this.navigateToOrdersPage(period, 0)
-      const ordersCount = await this.runInWorker('getOrdersCount')
-      this.log('info', `Found ${ordersCount} orders for period ${period}`)
-      if (ordersCount === 0) {
+      let periodBills
+      try {
+        periodBills = await this.fetchPeriodWithIframes(period, {
+          knownOrderIds,
+          knownSkipMaxDate
+        })
+      } catch (err) {
+        this.log(
+          'warn',
+          `Fast period extraction failed (${err.message}), falling back to page navigation`
+        )
+        await this.fetchPeriodWithNavigation(period, context)
         continue
       }
-      const pagesCount = Math.ceil(ordersCount / ORDERS_PER_PAGE)
-      // The launcher rebuilds its whole existing files index on every
-      // saveBills call, which gets slower and slower as files pile up and can
-      // eat the app 15 minutes job timeout. Save every few pages instead of
-      // every page to limit those rebuilds while keeping regular checkpoints.
-      let pendingBills = []
-      for (let page = 0; page < pagesCount; page++) {
-        this.log('info', `Fetching bills for page ${page + 1}/${pagesCount}`)
-        if (page > 0) {
-          await this.navigateToOrdersPage(period, page * ORDERS_PER_PAGE)
-        }
-        await this.runInWorkerUntilTrue({ method: 'waitForOrdersLoading' })
-        pendingBills.push(...(await this.fetchPageBills()))
-        const isLastPage = page === pagesCount - 1
-        const isCheckpoint = (page + 1) % SAVE_BILLS_EVERY_PAGES === 0
-        if (pendingBills.length > 0 && (isLastPage || isCheckpoint)) {
-          await this.saveBills(pendingBills, {
-            context,
-            fileIdAttributes: ['vendorRef'],
-            contentType: 'application/pdf',
-            qualificationLabel: 'other_invoice'
-          })
-          pendingBills = []
-        }
+      if (periodBills.length > 0) {
+        await this.saveBills(periodBills, {
+          context,
+          fileIdAttributes: ['vendorRef'],
+          contentType: 'application/pdf',
+          qualificationLabel: 'other_invoice'
+        })
       }
     }
+  }
+
+  // P
+  async getKnownOrderIds() {
+    // Orders whose bill is already saved can be skipped entirely : no invoice
+    // popover fetch and above all no saveBills call, which spares the launcher
+    // its costly existing files index rebuilds
+    try {
+      const bills = await this.queryAll({
+        toDefinition: () => ({ doctype: 'io.cozy.bills' })
+      })
+      const orderIds = new Set()
+      for (const bill of bills || []) {
+        const billVendor = String(bill.vendor || '').toLowerCase()
+        if (billVendor.startsWith('amazon') && bill.vendorRef) {
+          orderIds.add(String(bill.vendorRef).split('_')[0])
+        }
+      }
+      this.log('info', `Found ${orderIds.size} orders already saved`)
+      return Array.from(orderIds)
+    } catch (err) {
+      this.log('warn', `Could not list already saved bills: ${err.message}`)
+      return []
+    }
+  }
+
+  // P
+  async fetchPeriodWithIframes(period, { knownOrderIds, knownSkipMaxDate }) {
+    const ordersCount = await this.runInWorker('fetchOrdersCount', period)
+    this.log('info', `Found ${ordersCount} orders for period ${period}`)
+    if (ordersCount === 0) {
+      return []
+    }
+    const pagesCount = Math.ceil(ordersCount / ORDERS_PER_PAGE)
+    const rawBills = await this.runInWorker('extractPeriodBills', {
+      period,
+      pagesCount,
+      knownOrderIds,
+      knownSkipMaxDate
+    })
+    if (!Array.isArray(rawBills)) {
+      throw new Error('extractPeriodBills did not answer')
+    }
+    return this.splitMultiInvoiceBills(rawBills)
+  }
+
+  // P : previous navigation based flow, kept as fallback
+  async fetchPeriodWithNavigation(period, context) {
+    this.log('info', `📍️ fetchPeriodWithNavigation starts for ${period}`)
+    await this.navigateToOrdersPage(period, 0)
+    const ordersCount = await this.runInWorker('getOrdersCount')
+    this.log('info', `Found ${ordersCount} orders for period ${period}`)
+    if (ordersCount === 0) {
+      return
+    }
+    const pagesCount = Math.ceil(ordersCount / ORDERS_PER_PAGE)
+    // The launcher rebuilds its whole existing files index on every
+    // saveBills call : save every few pages instead of every page to limit
+    // those rebuilds while keeping regular checkpoints.
+    let pendingBills = []
+    for (let page = 0; page < pagesCount; page++) {
+      this.log('info', `Fetching bills for page ${page + 1}/${pagesCount}`)
+      if (page > 0) {
+        await this.navigateToOrdersPage(period, page * ORDERS_PER_PAGE)
+      }
+      await this.runInWorkerUntilTrue({ method: 'waitForOrdersLoading' })
+      const rawBills = await this.runInWorker('extractPageBills')
+      pendingBills.push(...this.splitMultiInvoiceBills(rawBills || []))
+      const isLastPage = page === pagesCount - 1
+      const isCheckpoint = (page + 1) % SAVE_BILLS_EVERY_PAGES === 0
+      if (pendingBills.length > 0 && (isLastPage || isCheckpoint)) {
+        await this.saveBills(pendingBills, {
+          context,
+          fileIdAttributes: ['vendorRef'],
+          contentType: 'application/pdf',
+          qualificationLabel: 'other_invoice'
+        })
+        pendingBills = []
+      }
+    }
+  }
+
+  // P
+  splitMultiInvoiceBills(bills) {
+    const result = []
+    for (const bill of bills) {
+      if (Array.isArray(bill.fileurl)) {
+        this.log('debug', 'fileurl is an Array, splitting bill')
+        let billNumber = 1
+        for (const url of bill.fileurl) {
+          const oneBill = {
+            ...bill
+          }
+          oneBill.fileurl = url
+          oneBill.filename = oneBill.filename.replace(
+            '.pdf',
+            `_facture${billNumber}.pdf`
+          )
+          oneBill.vendorRef = `${oneBill.vendorRef}_${billNumber}`
+          result.push(oneBill)
+          billNumber++
+        }
+      } else {
+        result.push(bill)
+      }
+    }
+    return result
   }
 
   // P
@@ -337,38 +463,6 @@ class AmazonContentScript extends ContentScript {
       `${orderHistoryUrl}?timeFilter=${period}&startIndex=${startIndex}`
     )
     await this.waitForElementInWorker('.num-orders')
-  }
-
-  // P
-  async fetchPageBills() {
-    this.log('info', '📍️ fetchPageBills starts')
-    const bills = await this.runInWorker('extractPageBills')
-    let pageBills = []
-    for (const bill of bills) {
-      if (bill === null || bill === 'skip') {
-        continue
-      }
-      if (Array.isArray(bill.fileurl)) {
-        this.log('debug', 'fileurl is an Array, splitting bill')
-        let billNumber = 1
-        for (const url of bill.fileurl) {
-          const oneBill = {
-            ...bill
-          }
-          oneBill.fileurl = url
-          oneBill.filename = oneBill.filename.replace(
-            '.pdf',
-            `_facture${billNumber}.pdf`
-          )
-          oneBill.vendorRef = `${oneBill.vendorRef}_${billNumber}`
-          pageBills.push(oneBill)
-          billNumber++
-        }
-      } else {
-        pageBills.push(bill)
-      }
-    }
-    return pageBills
   }
 
   async handleContextInfos(context) {
@@ -430,27 +524,160 @@ class AmazonContentScript extends ContentScript {
   }
 
   // W
-  async getOrdersCount() {
-    this.log('info', '📍️ getOrdersCount starts')
-    let ordersCount
-    await waitFor(
-      () => {
-        const element = document.querySelector('.num-orders')
-        if (element && element.textContent.includes('commande')) {
-          ordersCount = parseInt(element.textContent.trim(), 10)
-          if (isNaN(ordersCount)) {
-            ordersCount = 0
+  async fetchOrdersCount(period) {
+    this.log('info', '📍️ fetchOrdersCount starts')
+    const response = await window.fetch(
+      `${orderHistoryUrl}?timeFilter=${period}&startIndex=0`,
+      { credentials: 'include' }
+    )
+    if (!response.ok) {
+      throw new Error(`orders page fetch failed with status ${response.status}`)
+    }
+    const doc = new DOMParser().parseFromString(
+      await response.text(),
+      'text/html'
+    )
+    const element = doc.querySelector('.num-orders')
+    if (!element) {
+      throw new Error('num-orders not found in fetched orders page')
+    }
+    const count = parseInt(element.textContent.trim(), 10)
+    return isNaN(count) ? 0 : count
+  }
+
+  // W
+  async extractPeriodBills(options) {
+    this.log('info', '📍️ extractPeriodBills starts')
+    const {
+      period,
+      pagesCount,
+      knownOrderIds = [],
+      knownSkipMaxDate = '0000-00-00'
+    } = options
+    const known = new Set(knownOrderIds)
+    let skippedKnown = 0
+    const pageIndexes = Array.from(
+      { length: pagesCount },
+      (unused, index) => index
+    )
+    const ordersPerPage = await mapWithConcurrency(
+      pageIndexes,
+      IFRAME_CONCURRENCY,
+      async pageIndex => {
+        const pageOrders = await this.scrapeOrdersPageInIframe(
+          period,
+          pageIndex * ORDERS_PER_PAGE
+        )
+        return pageOrders.filter(order => {
+          const isKnown =
+            known.has(order.base.vendorRef) &&
+            order.base.date < knownSkipMaxDate
+          if (isKnown) {
+            skippedKnown++
           }
-          return true
-        }
-        return false
-      },
-      {
-        interval: 1000,
-        timeout: 30 * 1000
+          return !isKnown
+        })
       }
     )
-    return ordersCount
+    const orders = ordersPerPage.flat()
+    if (skippedKnown > 0) {
+      this.log('info', `${skippedKnown} orders already saved, skipping them`)
+    }
+    const bills = []
+    await mapWithConcurrency(orders, POPOVER_FETCH_CONCURRENCY, async order => {
+      if (!order.popoverUrl) {
+        this.log(
+          'info',
+          `No invoice popover for order ${order.base.vendorRef}, skipping`
+        )
+        return
+      }
+      const invoiceUrls = await this.fetchInvoiceUrls(order.popoverUrl)
+      if (invoiceUrls === null) {
+        this.log(
+          'warn',
+          `Could not fetch invoice links for order ${order.base.vendorRef}, skipping`
+        )
+        return
+      }
+      if (invoiceUrls.length === 0) {
+        this.log(
+          'info',
+          'Found an order with no bill attached to it, jumping this bill'
+        )
+        return
+      }
+      bills.push(this.makeBill(order.base, invoiceUrls))
+    })
+    return bills
+  }
+
+  // W
+  async scrapeOrdersPageInIframe(period, startIndex) {
+    this.log(
+      'info',
+      `📍️ scrapeOrdersPageInIframe starts - ${period} startIndex ${startIndex}`
+    )
+    const iframe = document.createElement('iframe')
+    iframe.style.cssText =
+      'position:absolute;left:-9999px;top:-9999px;width:1200px;height:900px;border:0'
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () =>
+            reject(
+              new Error(`iframe load timed out - startIndex ${startIndex}`)
+            ),
+          30 * 1000
+        )
+        iframe.addEventListener('load', () => {
+          clearTimeout(timer)
+          resolve()
+        })
+        iframe.src = `${orderHistoryUrl}?timeFilter=${period}&startIndex=${startIndex}`
+        document.body.appendChild(iframe)
+      })
+      // the cards content is rendered by the page own javascript after load
+      await waitFor(
+        () => {
+          const iframeDocument = iframe.contentDocument
+          if (!iframeDocument) {
+            return false
+          }
+          const cards = iframeDocument.querySelectorAll(orderCardSelector)
+          if (cards.length === 0) {
+            return false
+          }
+          return Array.from(cards).every(
+            card =>
+              card.querySelector('.order-header__header-list-item') &&
+              card.querySelector('.yohtmlc-order-id')
+          )
+        },
+        {
+          interval: 200,
+          timeout: {
+            milliseconds: 30000,
+            message: new TimeoutError(
+              `orders page in iframe did not render - startIndex ${startIndex}`
+            )
+          }
+        }
+      )
+      const orders = []
+      for (const card of iframe.contentDocument.querySelectorAll(
+        orderCardSelector
+      )) {
+        const base = this.parseOrderCard(card)
+        if (base === null) {
+          continue
+        }
+        orders.push({ base, popoverUrl: this.getInvoicePopoverUrl(card) })
+      }
+      return orders
+    } finally {
+      iframe.remove()
+    }
   }
 
   // W
@@ -491,6 +718,30 @@ class AmazonContentScript extends ContentScript {
   }
 
   // W
+  async getOrdersCount() {
+    this.log('info', '📍️ getOrdersCount starts')
+    let ordersCount
+    await waitFor(
+      () => {
+        const element = document.querySelector('.num-orders')
+        if (element && element.textContent.includes('commande')) {
+          ordersCount = parseInt(element.textContent.trim(), 10)
+          if (isNaN(ordersCount)) {
+            ordersCount = 0
+          }
+          return true
+        }
+        return false
+      },
+      {
+        interval: 1000,
+        timeout: 30 * 1000
+      }
+    )
+    return ordersCount
+  }
+
+  // W
   deleteElement(element) {
     // As we loop on the orders pages, every page contains the exact same elements.
     // To avoid matching an element of the previous page while the next one loads,
@@ -502,76 +753,45 @@ class AmazonContentScript extends ContentScript {
     return true
   }
 
-  // W
+  // W : fallback path, extracts the bills of the currently displayed page
   async extractPageBills() {
     this.log('info', '📍️ extractPageBills starts')
     const cards = Array.from(document.querySelectorAll(orderCardSelector))
-    // The invoice links live in a popover loaded lazily from an ajax url found
-    // in each card. Amazon only loads a popover content while it is displayed,
-    // so opening them one by one is slow : fetch all the ajax urls in parallel
-    // instead, and only fall back to the popover ui when a fetch fails.
-    const invoiceUrlsPerCard = await Promise.all(
-      cards.map(card => this.fetchInvoiceUrlsForCard(card))
-    )
-    const bills = []
-    for (let i = 0; i < cards.length; i++) {
-      bills.push(this.buildOrderBill(cards[i], i, invoiceUrlsPerCard[i]))
+    const parsedCards = []
+    for (const card of cards) {
+      const base = this.parseOrderCard(card)
+      if (base !== null) {
+        parsedCards.push({ card, base })
+      }
     }
+    const bills = []
+    await mapWithConcurrency(
+      parsedCards,
+      POPOVER_FETCH_CONCURRENCY,
+      async ({ card, base }) => {
+        const invoiceUrls = await this.fetchInvoiceUrlsForCard(card)
+        if (invoiceUrls === null) {
+          this.log(
+            'info',
+            `No invoice popover for order ${base.vendorRef}, skipping`
+          )
+          return
+        }
+        if (invoiceUrls.length === 0) {
+          this.log(
+            'info',
+            'Found an order with no bill attached to it, jumping this bill'
+          )
+          return
+        }
+        bills.push(this.makeBill(base, invoiceUrls))
+      }
+    )
     return bills
   }
 
   // W
-  async fetchInvoiceUrlsForCard(card) {
-    const factureDeclarative = Array.from(
-      card.querySelectorAll('span.a-declarative')
-    ).find(span => (span.textContent || '').trim().startsWith('Facture'))
-    let popoverUrl
-    try {
-      popoverUrl = JSON.parse(
-        factureDeclarative?.getAttribute('data-a-popover')
-      )?.url
-    } catch (err) {
-      popoverUrl = null
-    }
-    if (popoverUrl) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const response = await window.fetch(popoverUrl, {
-            credentials: 'include'
-          })
-          if (response.ok) {
-            const html = await response.text()
-            const doc = new DOMParser().parseFromString(html, 'text/html')
-            return Array.from(
-              doc.querySelectorAll('a[href*="invoice.pdf"]')
-            ).map(link => {
-              const href = link.getAttribute('href')
-              return href.startsWith('http') ? href : baseUrl + href
-            })
-          }
-          this.log(
-            'warn',
-            `Invoice popover fetch answered ${response.status} (attempt ${
-              attempt + 1
-            })`
-          )
-        } catch (err) {
-          this.log(
-            'warn',
-            `Invoice popover fetch failed: ${err.message} (attempt ${
-              attempt + 1
-            })`
-          )
-        }
-        await new Promise(resolve => setTimeout(resolve, 500))
-      }
-    }
-    // fallback : open the popover ui like a user would
-    return this.getOrderInvoiceUrls(card)
-  }
-
-  // W
-  buildOrderBill(card, cardIndex, invoiceUrls) {
+  parseOrderCard(card) {
     const headerItems = card.querySelectorAll('.order-header__header-list-item')
     const dateText = headerItems[0]
       ?.querySelector('.a-size-base')
@@ -580,41 +800,39 @@ class AmazonContentScript extends ContentScript {
       ?.querySelector('.a-size-base')
       ?.textContent.trim()
     if (!dateText || !totalText) {
-      this.log('warn', `Card ${cardIndex} misses date or total, skipping`)
-      return 'skip'
+      this.log('warn', 'Order card misses date or total, skipping')
+      return null
     }
     if (totalText.match(/crédit(s)? audio/g)) {
       this.log('info', 'Found an audiobook, jumping this bill')
-      return 'skip'
+      return null
     }
     const amountMatch = totalText.match(/([\d\s\u00a0.,]+)/)
     const currencyMatch = totalText.match(/([^\d\s\u00a0.,]+)/)
     if (!amountMatch) {
       this.log('warn', `Cannot parse amount "${totalText}", skipping`)
-      return 'skip'
+      return null
     }
-    const parsedAmount = parseFloat(
+    const amount = parseFloat(
       amountMatch[1].replace(/[\s\u00a0]/g, '').replace(',', '.')
     )
-    if (parsedAmount === 0) {
+    if (amount === 0) {
       this.log(
         'info',
         'Found a free product, no bill attached to it, jumping this bill'
       )
-      return 'skip'
+      return null
     }
     const currency = currencyMatch ? currencyMatch[1] : '€'
     const orderIdText = card.querySelector('.yohtmlc-order-id')?.textContent
     const orderIdMatch = orderIdText && orderIdText.match(/(\d{3}-\d+-\d+)/)
     if (!orderIdMatch) {
-      this.log('warn', `Cannot find order number on card ${cardIndex}`)
-      return 'skip'
+      this.log('warn', 'Cannot find order number on card, skipping')
+      return null
     }
-    const vendorRef = orderIdMatch[1]
     const parsedDate = parse(dateText, 'd MMMM yyyy', new Date(), {
       locale: fr
     })
-    const formattedDate = format(parsedDate, 'yyyy-MM-dd')
     const billProducts = []
     const seenProducts = new Set()
     const foundProducts = card.querySelectorAll(
@@ -632,30 +850,30 @@ class AmazonContentScript extends ContentScript {
         articleName
       })
     }
-    if (invoiceUrls === null) {
-      this.log('info', `No invoice popover for card ${cardIndex}, skipping`)
-      return 'skip'
+    return {
+      date: format(parsedDate, 'yyyy-MM-dd'),
+      amount,
+      currency,
+      vendorRef: orderIdMatch[1],
+      billProducts
     }
-    if (invoiceUrls.length === 0) {
-      this.log(
-        'info',
-        'Found an order with no bill attached to it, jumping this bill'
-      )
-      return 'skip'
-    }
+  }
+
+  // W
+  makeBill(base, invoiceUrls) {
     return {
       vendor: 'amazon.fr',
-      date: formattedDate,
-      amount: parsedAmount,
-      currency,
-      vendorRef,
+      date: base.date,
+      amount: base.amount,
+      currency: base.currency,
+      vendorRef: base.vendorRef,
       fileurl: invoiceUrls.length > 1 ? invoiceUrls : invoiceUrls[0],
-      filename: `${formattedDate}_${vendor}_${parsedAmount}${currency}.pdf`,
-      billProducts,
+      filename: `${base.date}_${vendor}_${base.amount}${base.currency}.pdf`,
+      billProducts: base.billProducts,
       fileAttributes: {
         metadata: {
           contentAuthor: 'amazon',
-          datetime: new Date(formattedDate),
+          datetime: new Date(base.date),
           datetimeLabel: 'issueDate',
           carbonCopy: true
         }
@@ -664,6 +882,77 @@ class AmazonContentScript extends ContentScript {
   }
 
   // W
+  getInvoicePopoverUrl(card) {
+    const factureDeclarative = Array.from(
+      card.querySelectorAll('span.a-declarative')
+    ).find(span => (span.textContent || '').trim().startsWith('Facture'))
+    let popoverUrl
+    try {
+      popoverUrl = JSON.parse(
+        factureDeclarative?.getAttribute('data-a-popover')
+      )?.url
+    } catch (err) {
+      popoverUrl = null
+    }
+    if (!popoverUrl) {
+      return null
+    }
+    return popoverUrl.startsWith('http') ? popoverUrl : baseUrl + popoverUrl
+  }
+
+  // W : fetch the invoice links list of an order from its popover ajax url.
+  // Returns null when the fetch failed, an array of urls otherwise.
+  async fetchInvoiceUrls(popoverUrl) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await window.fetch(popoverUrl, {
+          credentials: 'include'
+        })
+        if (response.ok) {
+          const doc = new DOMParser().parseFromString(
+            await response.text(),
+            'text/html'
+          )
+          return Array.from(doc.querySelectorAll('a[href*="invoice.pdf"]')).map(
+            link => {
+              const href = link.getAttribute('href')
+              return href.startsWith('http') ? href : baseUrl + href
+            }
+          )
+        }
+        this.log(
+          'warn',
+          `Invoice popover fetch answered ${response.status} (attempt ${
+            attempt + 1
+          })`
+        )
+      } catch (err) {
+        this.log(
+          'warn',
+          `Invoice popover fetch failed: ${err.message} (attempt ${
+            attempt + 1
+          })`
+        )
+      }
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    return null
+  }
+
+  // W : fallback path, on the live page the popover ui can be used when the
+  // direct ajax fetch fails
+  async fetchInvoiceUrlsForCard(card) {
+    const popoverUrl = this.getInvoicePopoverUrl(card)
+    if (popoverUrl) {
+      const invoiceUrls = await this.fetchInvoiceUrls(popoverUrl)
+      if (invoiceUrls !== null) {
+        return invoiceUrls
+      }
+    }
+    return this.getOrderInvoiceUrls(card)
+  }
+
+  // W : last resort, open the popover ui like a user would
   async getOrderInvoiceUrls(card) {
     const factureLink = Array.from(
       card.querySelectorAll('a.a-link-normal')
@@ -788,8 +1077,10 @@ connector
       'dismissCookieBanner',
       'clickSignInLink',
       'getOrdersCount',
+      'fetchOrdersCount',
       'deleteElement',
       'extractPageBills',
+      'extractPeriodBills',
       'waitForOrdersLoading',
       'scrollToTop'
     ]
