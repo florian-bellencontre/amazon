@@ -333,10 +333,9 @@ class AmazonContentScript extends ContentScript {
   // P
   async fetchPageBills() {
     this.log('info', '📍️ fetchPageBills starts')
-    const cardsCount = await this.runInWorker('getCardsCount')
+    const bills = await this.runInWorker('extractPageBills')
     let pageBills = []
-    for (let i = 0; i < cardsCount; i++) {
-      const bill = await this.runInWorker('fetchOrderBill', i)
+    for (const bill of bills) {
       if (bill === null || bill === 'skip') {
         continue
       }
@@ -483,12 +482,6 @@ class AmazonContentScript extends ContentScript {
   }
 
   // W
-  getCardsCount() {
-    this.log('info', '📍️ getCardsCount starts')
-    return document.querySelectorAll(orderCardSelector).length
-  }
-
-  // W
   deleteElement(element) {
     // As we loop on the orders pages, every page contains the exact same elements.
     // To avoid matching an element of the previous page while the next one loads,
@@ -501,13 +494,75 @@ class AmazonContentScript extends ContentScript {
   }
 
   // W
-  async fetchOrderBill(cardIndex) {
-    this.log('info', `📍️ fetchOrderBill starts for card ${cardIndex}`)
-    const card = document.querySelectorAll(orderCardSelector)[cardIndex]
-    if (!card) {
-      this.log('warn', `Card ${cardIndex} not found on page`)
-      return null
+  async extractPageBills() {
+    this.log('info', '📍️ extractPageBills starts')
+    const cards = Array.from(document.querySelectorAll(orderCardSelector))
+    // The invoice links live in a popover loaded lazily from an ajax url found
+    // in each card. Amazon only loads a popover content while it is displayed,
+    // so opening them one by one is slow : fetch all the ajax urls in parallel
+    // instead, and only fall back to the popover ui when a fetch fails.
+    const invoiceUrlsPerCard = await Promise.all(
+      cards.map(card => this.fetchInvoiceUrlsForCard(card))
+    )
+    const bills = []
+    for (let i = 0; i < cards.length; i++) {
+      bills.push(this.buildOrderBill(cards[i], i, invoiceUrlsPerCard[i]))
     }
+    return bills
+  }
+
+  // W
+  async fetchInvoiceUrlsForCard(card) {
+    const factureDeclarative = Array.from(
+      card.querySelectorAll('span.a-declarative')
+    ).find(span => (span.textContent || '').trim().startsWith('Facture'))
+    let popoverUrl
+    try {
+      popoverUrl = JSON.parse(
+        factureDeclarative?.getAttribute('data-a-popover')
+      )?.url
+    } catch (err) {
+      popoverUrl = null
+    }
+    if (popoverUrl) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const response = await window.fetch(popoverUrl, {
+            credentials: 'include'
+          })
+          if (response.ok) {
+            const html = await response.text()
+            const doc = new DOMParser().parseFromString(html, 'text/html')
+            return Array.from(
+              doc.querySelectorAll('a[href*="invoice.pdf"]')
+            ).map(link => {
+              const href = link.getAttribute('href')
+              return href.startsWith('http') ? href : baseUrl + href
+            })
+          }
+          this.log(
+            'warn',
+            `Invoice popover fetch answered ${response.status} (attempt ${
+              attempt + 1
+            })`
+          )
+        } catch (err) {
+          this.log(
+            'warn',
+            `Invoice popover fetch failed: ${err.message} (attempt ${
+              attempt + 1
+            })`
+          )
+        }
+        await new Promise(resolve => setTimeout(resolve, 500))
+      }
+    }
+    // fallback : open the popover ui like a user would
+    return this.getOrderInvoiceUrls(card)
+  }
+
+  // W
+  buildOrderBill(card, cardIndex, invoiceUrls) {
     const headerItems = card.querySelectorAll('.order-header__header-list-item')
     const dateText = headerItems[0]
       ?.querySelector('.a-size-base')
@@ -568,7 +623,6 @@ class AmazonContentScript extends ContentScript {
         articleName
       })
     }
-    const invoiceUrls = await this.getOrderInvoiceUrls(card)
     if (invoiceUrls === null) {
       this.log('info', `No invoice popover for card ${cardIndex}, skipping`)
       return 'skip'
@@ -725,9 +779,8 @@ connector
       'dismissCookieBanner',
       'clickSignInLink',
       'getOrdersCount',
-      'getCardsCount',
       'deleteElement',
-      'fetchOrderBill',
+      'extractPageBills',
       'waitForOrdersLoading',
       'scrollToTop'
     ]
