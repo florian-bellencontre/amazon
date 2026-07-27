@@ -17,6 +17,7 @@ const emailInputSelector = '#ap_email_login, #ap_email'
 const signOutLinkSelector = 'a[href*="/gp/flex/sign-out.html?"]'
 const orderCardSelector = '.order-card.js-order-card'
 const ORDERS_PER_PAGE = 10
+const SAVE_BILLS_EVERY_PAGES = 5
 // TODO use a flag to change this value
 let FORCE_FETCH_ALL = false
 const vendor = 'amazon'
@@ -294,20 +295,28 @@ class AmazonContentScript extends ContentScript {
         continue
       }
       const pagesCount = Math.ceil(ordersCount / ORDERS_PER_PAGE)
+      // The launcher rebuilds its whole existing files index on every
+      // saveBills call, which gets slower and slower as files pile up and can
+      // eat the app 15 minutes job timeout. Save every few pages instead of
+      // every page to limit those rebuilds while keeping regular checkpoints.
+      let pendingBills = []
       for (let page = 0; page < pagesCount; page++) {
         this.log('info', `Fetching bills for page ${page + 1}/${pagesCount}`)
         if (page > 0) {
           await this.navigateToOrdersPage(period, page * ORDERS_PER_PAGE)
         }
         await this.runInWorkerUntilTrue({ method: 'waitForOrdersLoading' })
-        const pageBills = await this.fetchPageBills()
-        if (pageBills.length > 0) {
-          await this.saveBills(pageBills, {
+        pendingBills.push(...(await this.fetchPageBills()))
+        const isLastPage = page === pagesCount - 1
+        const isCheckpoint = (page + 1) % SAVE_BILLS_EVERY_PAGES === 0
+        if (pendingBills.length > 0 && (isLastPage || isCheckpoint)) {
+          await this.saveBills(pendingBills, {
             context,
             fileIdAttributes: ['vendorRef'],
             contentType: 'application/pdf',
             qualificationLabel: 'other_invoice'
           })
+          pendingBills = []
         }
       }
     }
