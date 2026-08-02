@@ -14000,6 +14000,14 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       fileurl: invoiceUrls.length > 1 ? invoiceUrls : invoiceUrls[0],
       filename: `${base.date}_${vendor}_${base.amount}${base.currency}.pdf`,
       billProducts: base.billProducts,
+      // The banks app matches bills to operations by looking up the vendor in
+      // its brand dictionary, but 'amazon.fr' resolves no brand there (it
+      // expects 'Amazon' or 'amazon') so bank labels like "AMZN Mktp FR" were
+      // never matched. Give the brand regexp explicitly instead. The vendor
+      // value itself cannot change: it is part of the bills dedup key.
+      matchingCriterias: {
+        labelRegex: '\\bamazo?n\\b'
+      },
       fileAttributes: {
         metadata: {
           contentAuthor: 'amazon',
