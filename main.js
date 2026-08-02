@@ -13206,6 +13206,12 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   // P
   async ensureAuthenticated({ account }) {
     this.log('info', '📍️ Starting ensureAuthenticated')
+    // Keep the account name given by previous runs : if the amazon session is
+    // still valid but the credentials vault was emptied (app reinstall, new
+    // device...), it is our only way to give back the sourceAccountIdentifier
+    if (account?.auth?.accountName) {
+      this.store.accountName = account.auth.accountName
+    }
     await this.setUserAgent()
     if (!account) {
       await this.ensureNotAuthenticated()
@@ -14174,18 +14180,25 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       return {
         sourceAccountIdentifier: this.store.email
       }
-    } else {
-      let credentials = await this.getCredentials()
-      if (credentials && credentials.email) {
-        return {
-          sourceAccountIdentifier: credentials.email
-        }
-      } else {
-        throw new Error(
-          'No credentials were found, cannot give a sourceAccountIdentifier, aborting execution'
-        )
+    }
+    const credentials = await this.getCredentials()
+    if (credentials && credentials.email) {
+      return {
+        sourceAccountIdentifier: credentials.email
       }
     }
+    if (this.store && this.store.accountName) {
+      this.log(
+        'warn',
+        'No credentials found, using the existing account name as identifier'
+      )
+      return {
+        sourceAccountIdentifier: this.store.accountName
+      }
+    }
+    throw new Error(
+      'No credentials were found, cannot give a sourceAccountIdentifier, aborting execution'
+    )
   }
 }
 
